@@ -1,92 +1,127 @@
 const express = require('express');
-const http = require('http');
-const socketIO = require('socket.io');
-const bodyParser = require('body-parser');
-const passport = require('passport');
-const LocalStrategy = require('passport-local').Strategy;
+const http = require('node:http');
+const path = require('node:path');
 const session = require('express-session');
-const bcrypt = require('bcrypt');
+const rateLimit = require('express-rate-limit');
+const helmet = require('helmet');
+const MongoStore = require('connect-mongo');
+const { Server } = require('socket.io');
 
+const database = require('./ex');
+const { normalizeChatMessage, normalizeRoom } = require('./lib/validation');
+const { createRouter } = require('./routes');
 
+function requiredEnvironment(name) {
+  const value = process.env[name];
+  if (!value) throw new Error(`${name} is required`);
+  return value;
+}
 
-const app = express();
-const server = http.createServer(app);
-const io = socketIO(server);
-const port = 3000;
-
-app.use(session({
-  secret: 'mySecret', // substitua por uma chave secreta forte
-  resave: false,
-  saveUninitialized: false
-}));
-
-app.use(passport.initialize());
-app.use(passport.session());
-
-
-const routes = require('./routes/index.js'); // Importe as rotas
-const { withMongoDb, readData, findUserByNickname, findUserById, writeData } = require('./ex.js');
-
-app.use(bodyParser.urlencoded({ extended: true }));
-app.use(express.static('public'));
-app.use(express.urlencoded({ extended: true }));
-
-// Defina as rotas antes do restante do código
-app.use('/', routes);
-
-// Evento de conexão do socket.io
-io.on('connection', (socket) => {
-  console.log('Novo usuário conectado');
-
-  // Evento de recebimento de mensagem de chat
-  socket.on('chat message', (data) => {
-    io.emit('chat message', data); // Envia a mensagem para todos os clientes conectados
-  });
-
-  // Evento de desconexão do socket.io
-  socket.on('disconnect', () => {
-    console.log('Usuário desconectado');
-  });
-});
-
-passport.use(
-  new LocalStrategy({ usernameField: 'nickname', passwordField: 'senha' }, async (nickname, senha, done) => {
-    try {
-      const user = await findUserByNickname(nickname); // Use a função findUserByNickname aqui
-      
-      if (!user) {
-        return done(null, false, { message: 'Usuário não encontrado' });
-      }
-
-       bcrypt.compare(senha, user.senha, (err, isMatch) => {
-        if (err) throw err;
-        if (isMatch) {
-          return done(null, user);
-        } else {
-          return done(null, false, { message: 'Senha incorreta' });
-        }
-      });
-    } catch (err) {
-      console.error(err);
-      console.log(user);
-      return done(err);
-    }
-  })
-);
-passport.serializeUser((user, done) => {
-  done(null, user.id);
-});
-
-passport.deserializeUser(async (id, done) => {
-  try {
-    const user = await findUserById(id); // Use a função findUserById aqui
-    done(null, user);
-  } catch (err) {
-    console.error(err);
-    done(err, null);
+function sameOriginOnly(request, response, next) {
+  const origin = request.get('origin');
+  const expectedOrigin = `${request.protocol}://${request.get('host')}`;
+  if (!origin || origin !== expectedOrigin) {
+    return response.status(403).type('text').send('Cross-origin request rejected.');
   }
-});
+  next();
+}
 
-server.listen(port, () => {
-  console.log(`Servidor rodando em http://localhost:${port}`);
-});
+function createApplication(options = {}) {
+  const app = express();
+  const server = http.createServer(app);
+  const io = new Server(server, {
+    maxHttpBufferSize: 10_000,
+    serveClient: true,
+  });
+
+  const sessionSecret = options.sessionSecret ?? requiredEnvironment('SESSION_SECRET');
+  if (sessionSecret.length < 32) {
+    throw new Error('SESSION_SECRET must contain at least 32 characters');
+  }
+
+  const sessionStore = options.sessionStore ?? MongoStore.create({
+    dbName: process.env.MONGODB_DATABASE || 'cats_co',
+    mongoUrl: requiredEnvironment('MONGODB_URI'),
+    ttl: 60 * 60 * 12,
+  });
+  const sessionMiddleware = session({
+    cookie: {
+      httpOnly: true,
+      maxAge: 1000 * 60 * 60 * 12,
+      sameSite: 'strict',
+      secure: process.env.NODE_ENV === 'production',
+    },
+    name: 'cats.sid',
+    resave: false,
+    saveUninitialized: false,
+    secret: sessionSecret,
+    store: sessionStore,
+  });
+
+  app.disable('x-powered-by');
+  app.use(helmet({ contentSecurityPolicy: false }));
+  app.use(express.urlencoded({ extended: false, limit: '10kb' }));
+  app.use(sessionMiddleware);
+
+  const authLimiter = rateLimit({
+    legacyHeaders: false,
+    limit: 20,
+    standardHeaders: 'draft-8',
+    windowMs: 15 * 60 * 1000,
+  });
+  app.use(['/login', '/register', '/logout'], sameOriginOnly, authLimiter);
+
+  app.use((request, response, next) => {
+    if (request.path.toLowerCase().endsWith('.html')) {
+      return response.status(404).type('text').send('Page not found.');
+    }
+    next();
+  });
+  app.use(express.static(path.join(__dirname, 'public'), {
+    index: false,
+    maxAge: process.env.NODE_ENV === 'production' ? '1h' : 0,
+  }));
+  app.use('/', createRouter(options.userRepository ?? database));
+
+  app.use((error, request, response, next) => {
+    console.error(error);
+    if (response.headersSent) return next(error);
+    response.status(500).type('text').send('Internal server error.');
+  });
+
+  io.engine.use(sessionMiddleware);
+  io.use((socket, next) => {
+    if (!socket.request.session?.user) {
+      return next(new Error('Authentication required'));
+    }
+    next();
+  });
+  io.on('connection', (socket) => {
+    const room = normalizeRoom(socket.handshake.auth?.room);
+    const user = socket.request.session.user;
+    socket.join(room);
+
+    socket.on('chat message', (input) => {
+      const message = normalizeChatMessage(input);
+      if (!message) return;
+
+      io.to(room).emit('chat message', {
+        color: user.color,
+        message,
+        username: user.nickname,
+      });
+    });
+  });
+
+  return { app, io, server };
+}
+
+if (require.main === module) {
+  const port = Number.parseInt(process.env.PORT ?? '3000', 10);
+  const { server } = createApplication();
+  server.listen(port, () => {
+    console.log(`Cats&Co available at http://localhost:${port}`);
+  });
+}
+
+module.exports = { createApplication, sameOriginOnly };

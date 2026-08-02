@@ -1,58 +1,83 @@
-const { MongoClient } = require('mongodb');
+const { MongoClient, ObjectId } = require('mongodb');
 
-const uri = 'mongodb+srv://awakyy:M2007644aTlas@cluster0.twi7zs4.mongodb.net/?retryWrites=true&w=majority';
+let client;
+let usersCollectionPromise;
 
-const client = new MongoClient(uri, { useNewUrlParser: true, useUnifiedTopology: true });
+function getSettings() {
+  const uri = process.env.MONGODB_URI;
+  if (!uri) {
+    throw new Error('MONGODB_URI is required');
+  }
 
-// Nome da coleção
-const COLLECTION_NAME = 'users';
+  return {
+    databaseName: process.env.MONGODB_DATABASE || 'cats_co',
+    uri,
+  };
+}
 
-async function withMongoDb(callback) {
-  const client = new MongoClient(uri, { useNewUrlParser: true, useUnifiedTopology: true });
-  try {
-    await client.connect();
-    console.log('Conexão com o MongoDB estabelecida com sucesso!');
-    const db = client.db('cluster0');
-    const collection = db.collection(COLLECTION_NAME);
+async function getUsersCollection() {
+  if (!usersCollectionPromise) {
+    usersCollectionPromise = (async () => {
+      const { databaseName, uri } = getSettings();
+      client = new MongoClient(uri, { serverSelectionTimeoutMS: 5000 });
+      await client.connect();
 
-    return await callback(collection);
-  } catch (error) {
-    console.error('Erro ao trabalhar com o MongoDB:', error);
-    throw error;
-  } finally {
+      const collection = client.db(databaseName).collection('users');
+      await Promise.all([
+        collection.createIndex({ nicknameKey: 1 }, { unique: true, sparse: true }),
+        collection.createIndex({ email: 1 }, { unique: true, sparse: true }),
+      ]);
+      return collection;
+    })().catch((error) => {
+      usersCollectionPromise = undefined;
+      throw error;
+    });
+  }
+
+  return usersCollectionPromise;
+}
+
+async function createUser(user) {
+  const collection = await getUsersCollection();
+  const result = await collection.insertOne({
+    ...user,
+    createdAt: new Date(),
+  });
+  return { ...user, _id: result.insertedId };
+}
+
+async function findUserByNickname(nickname) {
+  const collection = await getUsersCollection();
+  const nicknameKey = nickname.trim().toLowerCase();
+
+  return collection.findOne({
+    $or: [
+      { nicknameKey },
+      { nickname: nicknameKey },
+      { nickname },
+    ],
+  });
+}
+
+async function findUserById(id) {
+  if (!ObjectId.isValid(id)) {
+    return null;
+  }
+  const collection = await getUsersCollection();
+  return collection.findOne({ _id: new ObjectId(id) });
+}
+
+async function closeDatabase() {
+  usersCollectionPromise = undefined;
+  if (client) {
     await client.close();
+    client = undefined;
   }
 }
 
-//funções 
-
-async function readData() {
-    return withMongoDb(async (collection) => {
-      const data = await collection.find({}).toArray();
-      return data;
-    });
-  }
-  
-  async function writeData(data) {
-    return withMongoDb(async (collection) => {
-      await collection.deleteMany({});
-      await collection.insertMany(data);
-    });
-  }
-  
-  async function findUserByNickname(nickname) {
-    return await withMongoDb(async (collection) => {
-      return await collection.findOne({ nickname: nickname });
-    });
-  }  
-  
-  async function findUserById(id) {
-     return await withMongoDb(async (collection) => {
-      return await collection.findOne({id: id});
-    });
-  }
-
-
-  
-
-module.exports = { withMongoDb, readData, findUserByNickname, findUserById, writeData };
+module.exports = {
+  closeDatabase,
+  createUser,
+  findUserById,
+  findUserByNickname,
+};

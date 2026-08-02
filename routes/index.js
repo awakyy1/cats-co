@@ -1,73 +1,108 @@
 const express = require('express');
-const router = express.Router();
-const app = express();
-const path = require('path');
-const passport = require('passport');
-const bcrypt = require('bcrypt');
-const { withMongoDb, readData, findUserByNickname, findUserById, writeData } = require('./../ex.js');
+const path = require('node:path');
+const bcrypt = require('bcryptjs');
 
+const { normalizeRegistration } = require('../lib/validation');
 
-let users=[];
+const publicDirectory = path.join(__dirname, '..', 'public');
 
+function requireAuthentication(request, response, next) {
+  if (!request.session.user) {
+    return response.redirect('/?error=authentication-required');
+  }
+  next();
+}
 
-router.get('/', (req, res) => {
-    res.sendFile(path.join(__dirname, '../public', 'home.html'));
-});
-  
-  router.get('/chat', (req, res) => {
-    res.sendFile(path.join(__dirname, '../public', 'chat.html'));
+function regenerateSession(request) {
+  return new Promise((resolve, reject) => {
+    request.session.regenerate((error) => error ? reject(error) : resolve());
   });
-  
-  router.get('/cafe', (req, res) => {
-    res.sendFile(path.join(__dirname, '../public', 'cafe/cafe.html'));
-  });
+}
 
-  router.get('/cfs', (req, res) => {
-    res.sendFile(path.join(__dirname, '../public', 'cafe/cfs/tetris.html'));
-  });
+function createRouter(userRepository) {
+  const router = express.Router();
 
-   router.get('/escritorio', (req, res) => {
-    res.sendFile(path.join(__dirname, '../public', 'meeting/meeting.html'));
+  router.get('/', (request, response) => {
+    response.sendFile(path.join(publicDirectory, 'home.html'));
   });
-
-  router.get('/registro', (req, res) => {
-    res.sendFile(path.join(__dirname, '../public', 'registro.html'));
+  router.get('/registro', (request, response) => {
+    response.sendFile(path.join(publicDirectory, 'registro.html'));
   });
 
-  router.get('/draw', (req, res) => {
-    res.sendFile(path.join(__dirname, '../public', 'meeting/etchasketch/draw.html'));
-  });
+  const privatePages = new Map([
+    ['/chat', 'chat.html'],
+    ['/cafe', 'cafe/cafe.html'],
+    ['/cfs', 'cafe/cfs/tetris.html'],
+    ['/escritorio', 'meeting/meeting.html'],
+    ['/draw', 'meeting/etchasketch/draw.html'],
+  ]);
 
-  router.post('/register', async (req, res) => {
+  for (const [route, file] of privatePages) {
+    router.get(route, requireAuthentication, (request, response) => {
+      response.sendFile(path.join(publicDirectory, file));
+    });
+  }
+
+  router.post('/register', async (request, response, next) => {
     try {
-      const hashedPassword = await bcrypt.hash(req.body.senha, 10);
-      const user = {
-        id: Date.now(),
-        nome: req.body.nome,
-        nickname: req.body.nickname,
-        email: req.body.email,
-        senha: hashedPassword,
-        userColors: req.body.userColors
-      };
-      users.push(user);
-      // Aguarde a conclusão da função writeData antes de redirecionar
-      await writeData(users);
-      res.redirect('/');
-    } catch (err) {
-      console.error(err); // Adicione esta linha para ver o erro no console, se houver algum
-      res.redirect('/registro');
+      const { errors, value } = normalizeRegistration(request.body);
+      if (errors.length > 0) {
+        return response.redirect('/registro?error=invalid-registration');
+      }
+
+      const passwordHash = await bcrypt.hash(value.password, 12);
+      await userRepository.createUser({
+        color: value.color,
+        email: value.email,
+        name: value.name,
+        nickname: value.nickname,
+        nicknameKey: value.nicknameKey,
+        passwordHash,
+      });
+      response.redirect('/?registered=1');
+    } catch (error) {
+      if (error?.code === 11000) {
+        return response.redirect('/registro?error=account-exists');
+      }
+      next(error);
     }
   });
 
+  router.post('/login', async (request, response, next) => {
+    try {
+      const nickname = String(request.body.nickname ?? '').trim();
+      const password = String(request.body.senha ?? '');
+      const user = nickname ? await userRepository.findUserByNickname(nickname) : null;
+      const passwordHash = user?.passwordHash ?? user?.senha;
+      const authenticated = passwordHash
+        ? await bcrypt.compare(password, passwordHash)
+        : false;
 
-// Rota para autenticação de usuários (POST)
-router.post(
-  '/login',
-   passport.authenticate('local', {
-    successRedirect: '/chat',
-    failureRedirect: '/',
-  })
-);
+      if (!authenticated) {
+        return response.redirect('/?error=invalid-credentials');
+      }
 
-  module.exports = router;
-  
+      await regenerateSession(request);
+      request.session.user = {
+        color: user.color ?? user.userColors ?? '#222222',
+        id: String(user._id),
+        nickname: user.nickname,
+      };
+      response.redirect('/chat');
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  router.post('/logout', requireAuthentication, (request, response, next) => {
+    request.session.destroy((error) => {
+      if (error) return next(error);
+      response.clearCookie('cats.sid');
+      response.redirect('/');
+    });
+  });
+
+  return router;
+}
+
+module.exports = { createRouter, requireAuthentication };
